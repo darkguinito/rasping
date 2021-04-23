@@ -1,0 +1,216 @@
+#!/bin/sh
+
+set -euo pipefail
+#
+# Flash Raspberry Pi SD card [buildroot]
+#
+# Guillermo A. Amaral B. <g@maral.me>
+# Geoffrey 'Frogeye' Preud'homme <geoffrey@frogeye.fr>
+#
+
+BASEDIR="$( cd "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )"
+SDCARD="${1-/dev/sdb}"
+OUTPUT=images
+RASPBIAN_IMAGE_REPO=https://downloads.raspberrypi.org/raspios_lite_armhf/images
+RASPBIAN_RELEASE=raspios_lite_armhf-2021-03-25/2021-03-04-raspios-buster-armhf-lite.zip
+
+export $(egrep -v '^#' .env | xargs)
+FILENAME=$(basename "${RASPBIAN_RELEASE}")
+IMAGE=${OUTPUT}/${FILENAME%.zip}.img
+
+download() {
+  if [ ! -f "${OUTPUT}/${FILENAME}" ] ; then
+    ${WGET} -P "${OUTPUT}" "${RASPBIAN_IMAGE_REPO}/${RASPBIAN_RELEASE}"
+  fi
+
+  echo "--- Unziping raspbian image ${IMAGE}"
+  [[ -d "${OUTPUT}" ]] || ${MKDIR} ${OUTPUT}
+  ${UNZIP} -n -d "${OUTPUT}" "${OUTPUT}/${FILENAME}"
+}
+
+usage() {
+	echo "Usage: ${0} [SDCARD]"
+	echo "Where SDCARD is your SD card device node, for example: /dev/sdx"
+	echo
+	echo "You will require *root* privileges in order to use this script."
+	echo
+}
+
+confirm() {
+	echo "You are about to totally decimate the following device node: ${SDCARD}"
+	echo
+	echo "If you are sure you want to continue? (Please write \"YES\" in all caps)"
+
+	read CONTUNUE
+
+	if [ "${CONTUNUE}" != "YES" ]; then
+		echo "User didn't write \"YES\"... ABORTING!"
+		exit 1
+	fi
+}
+
+section() {
+	echo "*****************************************************************************************"
+	echo "> ${*}"
+	echo "*****************************************************************************************"
+	sleep 1
+}
+
+# environment overrides
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# check parameters
+
+if [ -z "${SDCARD}" ] || [ "${SDCARD}" = "-h" ] || [ "${SDCARD}" = "--help" ]; then
+	usage
+	exit 0
+fi
+
+# check if node is a block device
+
+if [ ! -b "${SDCARD}" ]; then
+	echo "${SDCARD} is not a block device!"
+	exit 1
+fi
+
+# root privilege check
+
+USERID=`id -u`
+if [ ${USERID} -ne 0 ]; then
+	echo "${0} requires root privileges in order to work."
+	exit 0
+fi
+
+# dependencies
+
+CP=`which cp`
+CUT=`which cut`
+DD=`which dd`
+FDISK=`which fdisk`
+FINDMNT=`which findmnt`
+GREP=`which grep`
+MKDIR=`which mkdir`
+PARTED=`which parted`
+RESIZE2FS=`which resize2fs`
+SED=`which sed`
+SYNC=`which sync`
+UDISK=`which udisksctl`
+UMOUNT=`which umount`
+UNZIP=`which unzip`
+WGET=`which wget`
+
+if [ -z "${CP}" ] ||
+   [ -z "${CUT}" ] ||
+   [ -z "${DD}" ] ||
+   [ -z "${FDISK}" ] ||
+   [ -z "${FINDMNT}" ] ||
+   [ -z "${GREP}" ] ||
+   [ -z "${MKDIR}" ] ||
+   [ -z "${PARTED}" ] ||
+   [ -z "${RESIZE2FS}" ] ||
+   [ -z "${SED}" ] ||
+   [ -z "${SYNC}" ] ||
+   [ -z "${UDISK}" ] ||
+   [ -z "${UMOUNT}" ] ||
+   [ -z "${UNZIP}" ] ||
+   [ -z "${WGET}" ] ; then
+	echo "Missing dependencies:\n"
+	echo "CP=${CP}"
+	echo "CUT=${CUT}"
+	echo "DD=${DD}"
+	echo "FDISK=${FDISK}"
+	echo "FINDMNT=${FINDMNT}"
+	echo "GREP=${GREP}"
+	echo "GREP=${MKDIR}"
+	echo "PARTED=${PARTED}"
+	echo "RESIZE2FS=${RESIZE2FS}"
+	echo "SED=${SED}"
+	echo "SYNC=${SYNC}"
+  echo "UDISK=${UDISK}" 
+  echo "UMOUNT=${UMOUNT}" 
+  echo "UMOUNT=${UNZIP}" 
+  echo "UMOUNT=${WGET}" 
+	exit 1
+fi
+
+# sanity check
+
+download
+
+if [ -z "${IMAGE}" ] || [ ! -f "${IMAGE}" ]; then
+  echo "Didn't find ${IMAGE} ! ABORT."
+  exit 1
+fi
+
+# warn user
+
+confirm
+
+# figure out partition pattern
+
+SDCARDP="$(fdisk -l ${SDCARD} | grep ${SDCARD} | tail -1 | cut -d ' ' -f 1 | sed 's/[0-9]\+$//')"
+
+# unmount eventually mounted partitions
+
+${UMOUNT} ${SDCARDP}1 &> /dev/null || true
+${UMOUNT} ${SDCARDP}2 &> /dev/null || true
+
+# write image
+
+section "Writing to SD card..."
+
+${DD} status=progress if=${IMAGE} of=${SDCARD}
+
+# resize root partition
+
+section "Resizing root partition..."
+
+${PARTED} ${SDCARD} <<END
+print
+resizepart 2
+100%
+print
+quit
+END
+
+sleep 1
+
+# resize root filesystem
+
+section "Resizing root filesystem..."
+
+${RESIZE2FS} ${SDCARDP}2
+
+${SYNC}
+
+section "Finished!"
+
+
+sleep 1
+${UDISK} mount -b ${SDCARD}1 
+
+sleep 1
+MOUNTPATH=`${FINDMNT} -n -o TARGET ${SDCARD}1`
+
+echo "**********************"
+echo "* Copying boot files *"
+echo "**********************"
+
+IDIR=${BASEDIR}/boot/*
+ODIR=${MOUNTPATH}/
+
+echo "From  ${IDIR} to ${ODIR}"
+
+${CP} ${IDIR} ${ODIR}
+
+echo "Copy Finish"
+# will fail for error codes > 1
+retVal=$?
+if [[ ${retVal} -ne 0 ]]; then
+    echo "Error copying"
+fi
+
+echo "!!! Flashing End !!!"
+
+exit $retVal
